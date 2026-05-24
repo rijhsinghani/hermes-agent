@@ -35,6 +35,14 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway.operator_mode import (
+    OperatorAction,
+    OperatorDecision,
+    OperatorRun,
+    find_exact_run,
+    list_tmux_operator_runs,
+    resume_tmux_run,
+)
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -51,6 +59,22 @@ from gateway.platforms.base import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _slack_escape_mrkdwn(value: str) -> str:
+    """Escape Slack mrkdwn control characters in untrusted text."""
+    return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _slack_code_span(value: str) -> str:
+    """Return safe text for a Slack inline code span."""
+    return _slack_escape_mrkdwn(value).replace("`", "'")
+
+
+def _slack_code_block(value: str) -> str:
+    """Return safe text for a Slack fenced code block."""
+    return _slack_escape_mrkdwn(value).replace("```", "`\u200b``")
+
 
 # ContextVar carrying the user_id of the slash-command invoker.
 # Set in _handle_slash_command, read in send() to match the correct
@@ -321,6 +345,10 @@ class SlackAdapter(BasePlatformAdapter):
         # Track pending approval message_ts → resolved flag to prevent
         # double-clicks on approval buttons.
         self._approval_resolved: Dict[str, bool] = {}
+        # Track pending remote operator cards. Values are keyed by Slack
+        # message ts for idempotency and by run_id for button resolution.
+        self._operator_resolved: Dict[str, bool] = {}
+        self._operator_runs: Dict[str, OperatorRun] = {}
         # Track timestamps of messages sent by the bot so we can respond
         # to thread replies even without an explicit @mention.
         self._bot_message_ts: set = set()
@@ -680,6 +708,17 @@ class SlackAdapter(BasePlatformAdapter):
                 "hermes_confirm_cancel",
             ):
                 self._app.action(_action_id)(self._handle_slash_confirm_action)
+
+            # Register Block Kit action handlers for remote operator cards.
+            for _action_id in (
+                "hermes_operator_continue",
+                "hermes_operator_approve_once",
+                "hermes_operator_deny",
+                "hermes_operator_pause",
+                "hermes_operator_stop",
+                "hermes_operator_summary",
+            ):
+                self._app.action(_action_id)(self._handle_operator_action)
 
             # Start Socket Mode handler in background
             self._handler = AsyncSocketModeHandler(self._app, app_token, proxy=proxy_url)
@@ -2382,6 +2421,253 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("[Slack] send_slash_confirm failed: %s", e, exc_info=True)
             return SendResult(success=False, error=str(e))
+
+    async def send_operator_status_card(
+        self,
+        chat_id: str,
+        run: OperatorRun,
+        decision: Optional[OperatorDecision] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a remote operator status card with native Block Kit buttons."""
+        if not self._app:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            status = decision or run.status
+            output_preview = run.last_output.strip()
+            if len(output_preview) > 1800:
+                output_preview = output_preview[-1800:]
+            if not output_preview:
+                output_preview = "No recent output captured."
+            output_preview = _slack_code_block(output_preview)
+            safe_run_id = _slack_code_span(run.run_id)
+            safe_target = _slack_code_span(run.target)
+
+            value = json.dumps({"run_id": run.run_id, "target": run.target}, separators=(",", ":"))
+            blocks = [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            f":satellite: *Hermes operator status*\n"
+                            f"*Run:* `{safe_run_id}`\n"
+                            f"*Target:* `{safe_target}`\n"
+                            f"*Status:* `{status.value}`\n"
+                            f"```{output_preview}```"
+                        ),
+                    },
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Continue"},
+                            "style": "primary",
+                            "action_id": "hermes_operator_continue",
+                            "value": value,
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Approve once"},
+                            "action_id": "hermes_operator_approve_once",
+                            "value": value,
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Deny"},
+                            "style": "danger",
+                            "action_id": "hermes_operator_deny",
+                            "value": value,
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Summary"},
+                            "action_id": "hermes_operator_summary",
+                            "value": value,
+                        },
+                    ],
+                },
+            ]
+
+            kwargs: Dict[str, Any] = {
+                "channel": chat_id,
+                "text": f"Hermes operator status: {_slack_escape_mrkdwn(run.run_id)} is {status.value}",
+                "blocks": blocks,
+            }
+            thread_ts = self._resolve_thread_ts(None, metadata)
+            if thread_ts:
+                kwargs["thread_ts"] = thread_ts
+
+            result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+            msg_ts = result.get("ts", "")
+            if msg_ts:
+                self._operator_resolved[msg_ts] = False
+            self._operator_runs[run.run_id] = run
+            return SendResult(success=True, message_id=msg_ts, raw_response=result)
+        except Exception as e:
+            logger.error("[Slack] send_operator_status_card failed: %s", e, exc_info=True)
+            return SendResult(success=False, error=str(e))
+
+    async def _handle_operator_action(self, ack, body, action) -> None:
+        """Handle a remote operator Block Kit action."""
+        await ack()
+
+        action_id = action.get("action_id", "")
+        message = body.get("message", {})
+        msg_ts = message.get("ts", "")
+        channel_id = body.get("channel", {}).get("id", "")
+        user_name = body.get("user", {}).get("name", "unknown")
+        user_id = body.get("user", {}).get("id", "")
+
+        allowed_csv = os.getenv("SLACK_ALLOWED_USERS", "").strip()
+        if allowed_csv:
+            allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+            if "*" not in allowed_ids and user_id not in allowed_ids:
+                logger.warning(
+                    "[Slack] Unauthorized operator click by %s (%s), ignoring",
+                    user_name, user_id,
+                )
+                return
+
+        try:
+            payload = json.loads(action.get("value", "{}"))
+        except Exception:
+            payload = {}
+        run_id = str(payload.get("run_id") or "")
+        target = str(payload.get("target") or "")
+        run = self._operator_runs.get(run_id)
+
+        action_map = {
+            "hermes_operator_continue": OperatorAction.CONTINUE,
+            "hermes_operator_approve_once": OperatorAction.APPROVE_ONCE,
+            "hermes_operator_deny": OperatorAction.DENY,
+            "hermes_operator_pause": OperatorAction.PAUSE,
+            "hermes_operator_stop": OperatorAction.STOP,
+            "hermes_operator_summary": OperatorAction.SUMMARY,
+        }
+        operator_action = action_map.get(action_id, OperatorAction.SUMMARY)
+
+        resume_actions = {OperatorAction.CONTINUE, OperatorAction.APPROVE_ONCE, OperatorAction.DENY}
+        consumes_card = operator_action in resume_actions
+        if consumes_card and self._operator_resolved.pop(msg_ts, True):
+            return
+
+        bridge_message = "No resume action sent."
+        if run is None:
+            bridge_message = "Refused: operator run is unknown or expired. Refresh operator status and try again."
+        elif operator_action in resume_actions:
+            current_run = find_exact_run(target, list_tmux_operator_runs())
+            stored_created = run.metadata.get("created", "")
+            current_created = current_run.metadata.get("created", "") if current_run else ""
+            if current_run is None:
+                bridge_message = "Refused: current tmux target is missing or ambiguous. Refresh operator status and try again."
+            elif current_run.run_id != run.run_id:
+                bridge_message = "Refused: current tmux run does not match this operator card. Refresh operator status and try again."
+            elif stored_created and current_created and stored_created != current_created:
+                bridge_message = "Refused: tmux session metadata changed. Refresh operator status and try again."
+            else:
+                bridge = resume_tmux_run(current_run, operator_action, target=target)
+                bridge_message = bridge.message
+        elif operator_action in {OperatorAction.PAUSE, OperatorAction.STOP}:
+            label = "Pause" if operator_action == OperatorAction.PAUSE else "Stop"
+            bridge_message = f"Refused: {label} is not implemented yet. No action was sent."
+        elif operator_action == OperatorAction.SUMMARY:
+            bridge_message = (run.last_output.strip()[-700:] if run.last_output.strip() else "No summary available.")
+
+        label_map = {
+            OperatorAction.CONTINUE: "Continue",
+            OperatorAction.APPROVE_ONCE: "Approve once",
+            OperatorAction.DENY: "Deny",
+            OperatorAction.PAUSE: "Pause",
+            OperatorAction.STOP: "Stop",
+            OperatorAction.SUMMARY: "Summary",
+        }
+        safe_user_name = _slack_escape_mrkdwn(user_name)
+        safe_bridge_message = _slack_escape_mrkdwn(bridge_message).replace("```", "`\u200b``")
+        decision_text = f"{label_map[operator_action]} selected by {safe_user_name}. {safe_bridge_message}"
+
+        original_text = ""
+        for block in message.get("blocks", []):
+            if block.get("type") == "section":
+                original_text = block.get("text", {}).get("text", "")
+                break
+
+        updated_blocks = [
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": original_text or "Hermes operator status"},
+            },
+            {
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": decision_text}],
+            },
+        ]
+        if operator_action == OperatorAction.SUMMARY:
+            updated_blocks.append(
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Summary"},
+                            "action_id": "hermes_operator_summary",
+                            "value": action.get("value", ""),
+                        }
+                    ],
+                }
+            )
+        elif operator_action in {OperatorAction.PAUSE, OperatorAction.STOP}:
+            value = action.get("value", "")
+            updated_blocks.append(
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Continue"},
+                            "style": "primary",
+                            "action_id": "hermes_operator_continue",
+                            "value": value,
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Approve once"},
+                            "action_id": "hermes_operator_approve_once",
+                            "value": value,
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Deny"},
+                            "style": "danger",
+                            "action_id": "hermes_operator_deny",
+                            "value": value,
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Summary"},
+                            "action_id": "hermes_operator_summary",
+                            "value": value,
+                        },
+                    ],
+                }
+            )
+
+        try:
+            await self._get_client(channel_id).chat_update(
+                channel=channel_id,
+                ts=msg_ts,
+                text=decision_text,
+                blocks=updated_blocks,
+            )
+            logger.info(
+                "Slack operator action %s for run %s by %s: %s",
+                operator_action.value, run_id, user_name, bridge_message,
+            )
+        except Exception as e:
+            logger.warning("[Slack] Failed to update operator message: %s", e)
 
     async def _handle_slash_confirm_action(self, ack, body, action) -> None:
         """Handle a slash-confirm button click from Block Kit."""
